@@ -30,6 +30,7 @@ Features:
        - pinned (== latest)
        - gte (>= latest) (default)
        - lte (<= latest)
+    10. Can ignore specific dependencies from being updated.
 
 Example usage:
     $ python update_dependencies.py --file pyproject.toml --log-level DEBUG --verbose --dry-run
@@ -45,20 +46,24 @@ Example usage:
     $ python update_dependencies.py --cache-ttl 0    # 0 cache (always fetch latest)
     $ python update_dependencies.py --cache-file .my_cache.json
     $ python update_dependencies.py --version-spec pinned
+    $ python update_dependencies.py --ignore-dependency starlette
+    $ python update_dependencies.py --ignore-dependency starlette --ignore-dependency fastapi
 """
 
+# Standard
 import argparse
 import asyncio
 import json
 import logging
 import os
+from pathlib import Path
 import re
 import shutil
 import sys
 import time
-from pathlib import Path
 from typing import (
     Any,
+    cast,
     Dict,
     List,
     NamedTuple,
@@ -67,14 +72,14 @@ from typing import (
     Tuple,
     TypeVar,
     Union,
-    cast,
 )
 
+# Third-Party
+from colorama import Fore, init, Style
 import httpx
 import tomlkit
-import yaml
-from colorama import Fore, Style, init
 from tomlkit.items import Array, Comment, Item, String
+import yaml
 
 # =====================================================================
 # GLOBAL CONFIGURATION AND CONSTANTS
@@ -105,9 +110,7 @@ DEFAULT_LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 DEFAULT_LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 #: Regex pattern for splitting dependencies into (name, extras, spec).
-DEP_PATTERN = re.compile(
-    r"^(?P<name>[A-Za-z0-9_.\-]+)(?P<extras>\[.*?\])?(?P<spec>.*)$"
-)
+DEP_PATTERN = re.compile(r"^(?P<name>[A-Za-z0-9_.\-]+)(?P<extras>\[.*?\])?(?P<spec>.*)$")
 
 #: ANSI color settings
 COLOR_SUCCESS = Fore.GREEN
@@ -115,6 +118,7 @@ COLOR_WARNING = Fore.YELLOW
 COLOR_ERROR = Fore.RED
 COLOR_INFO = Fore.CYAN
 COLOR_HIGHLIGHT = Fore.MAGENTA
+COLOR_SKIP = Fore.BLUE
 
 #: Exit codes
 EXIT_SUCCESS = 0
@@ -190,16 +194,10 @@ def load_cache_from_file(path: str) -> None:
             # Rebuild it as a dict of {pkg_name: (version, timestamp)}
             loaded_cache = {}
             for pkg, val in data.items():
-                if (
-                    isinstance(val, list)
-                    and len(val) == 2
-                    and isinstance(val[1], (int, float))
-                ):
+                if isinstance(val, list) and len(val) == 2 and isinstance(val[1], (int, float)):
                     loaded_cache[pkg] = (val[0], float(val[1]))
             _CACHE = loaded_cache
-            logger.info(
-                f"\n🗂  Loaded cache from '{path}' with {len(_CACHE)} entries.\n"
-            )
+            logger.info(f"\n🗂  Loaded cache from '{path}' with {len(_CACHE)} entries.\n")
     except Exception as exc:
         logger.warning(f"Could not load cache from {path}: {exc}")
 
@@ -253,15 +251,11 @@ def get_cached_version(pkg_name: str, cache_ttl: float) -> Optional[str]:
     version, fetch_time = entry
     age = time.time() - fetch_time
     if age < cache_ttl:
-        logger.info(
-            f"📦 [CACHE HIT] {pkg_name}: {version} (age={age:.1f}s, ttl={cache_ttl}s)"
-        )
+        logger.info(f"📦 [CACHE HIT] {pkg_name}: {version} (age={age:.1f}s, ttl={cache_ttl}s)")
         return version
 
     # Expired; remove and return None
-    logger.info(
-        f"♻️ [CACHE EXPIRED] {pkg_name} cache age={age:.1f}s ttl={cache_ttl}s. Removing entry."
-    )
+    logger.info(f"♻️ [CACHE EXPIRED] {pkg_name} cache age={age:.1f}s ttl={cache_ttl}s. Removing entry.")
     del _CACHE[pkg_name]
     return None
 
@@ -312,13 +306,9 @@ def read_depsorter_config(
         with config_path.open("r", encoding="utf-8") as f:
             parsed = yaml.safe_load(f)
             if not isinstance(parsed, dict):
-                logger.warning(
-                    "`.depsorter.yml` is not a valid YAML dictionary."
-                )
+                logger.warning("`.depsorter.yml` is not a valid YAML dictionary.")
                 return {}
-            logger.info(
-                f"📄 Local YAML config '{config_filename}' loaded successfully."
-            )
+            logger.info(f"📄 Local YAML config '{config_filename}' loaded successfully.")
             return parsed
     except Exception as exc:
         logger.warning(f"Error reading {config_filename}: {exc}")
@@ -336,6 +326,7 @@ async def fetch_latest_version(
     semaphore: asyncio.Semaphore,
     timeout: float,
     cache_ttl: float,
+    ignored_dependencies: Set[str],
 ) -> Tuple[str, Optional[str]]:
     """
     Query PyPI for the latest version of a package (async), with persistent caching.
@@ -348,11 +339,17 @@ async def fetch_latest_version(
         semaphore: A semaphore to limit concurrent requests.
         timeout: Per-request timeout in seconds.
         cache_ttl: Time-to-live for cached results in seconds.
+        ignored_dependencies: Set of package names to skip updating.
 
     Returns:
         A tuple of `(pkg_name, version_or_None)`.
         If an error or a 404 occurs, the version is None.
     """
+    # Check if this dependency should be ignored
+    if pkg_name.lower() in ignored_dependencies:
+        logger.info(f"🚫 [IGNORED] Skipping {pkg_name} (in ignore list)")
+        return pkg_name, None
+
     # Check cache before hitting the semaphore
     cached_version = get_cached_version(pkg_name, cache_ttl)
     if cached_version is not None:
@@ -370,25 +367,17 @@ async def fetch_latest_version(
                 logger.debug(f"Fetched version for {pkg_name}: {version}")
                 return pkg_name, version
 
-            logger.warning(
-                f"⚠️ Could not get version for {pkg_name} (HTTP {resp.status_code})"
-            )
-            print(
-                f"{COLOR_WARNING}Warning: Could not get version for {pkg_name} (HTTP {resp.status_code})"
-            )
+            logger.warning(f"⚠️ Could not get version for {pkg_name} (HTTP {resp.status_code})")
+            print(f"{COLOR_WARNING}Warning: Could not get version for {pkg_name} (HTTP {resp.status_code})")
             store_cached_version(pkg_name, None)
             return pkg_name, None
 
         except httpx.TimeoutException:
             logger.warning(f"⚠️ Timeout while fetching version for {pkg_name}")
-            print(
-                f"{COLOR_WARNING}Timeout while fetching version for {pkg_name}"
-            )
+            print(f"{COLOR_WARNING}Timeout while fetching version for {pkg_name}")
         except httpx.HTTPError as e:
             logger.error(f"💥 HTTP error fetching version for {pkg_name}: {e}")
-            print(
-                f"{COLOR_ERROR}HTTP error fetching version for {pkg_name}: {e}"
-            )
+            print(f"{COLOR_ERROR}HTTP error fetching version for {pkg_name}: {e}")
         except Exception as e:
             logger.error(
                 f"💥 Unexpected error fetching version for {pkg_name}: {e}",
@@ -407,6 +396,7 @@ async def fetch_all_latest_versions(
     client_timeout: float,
     request_timeout: float,
     cache_ttl: float,
+    ignored_dependencies: Set[str],
 ) -> VersionDict:
     """
     Concurrently query PyPI for the latest versions of multiple packages.
@@ -419,6 +409,7 @@ async def fetch_all_latest_versions(
         client_timeout: Overall async client timeout in seconds.
         request_timeout: Per-request timeout in seconds.
         cache_ttl: Time-to-live for cached results in seconds.
+        ignored_dependencies: Set of package names to skip updating.
 
     Returns:
         A dict mapping package name -> latest version (or None).
@@ -427,27 +418,25 @@ async def fetch_all_latest_versions(
         logger.warning("⚠️ No packages provided to fetch versions for.")
         return {}
 
-    logger.info(
-        f"\n📦 [FETCH] Gathering versions for {len(package_names)} packages ===\n"
-    )
+    # Filter out ignored dependencies for fetching
+    packages_to_fetch = package_names - ignored_dependencies
+    ignored_count = len(package_names) - len(packages_to_fetch)
+
+    if ignored_count > 0:
+        logger.info(f"🚫 Ignoring {ignored_count} dependencies: {', '.join(sorted(ignored_dependencies & package_names))}")
+
+    logger.info(f"\n📦 [FETCH] Gathering versions for {len(packages_to_fetch)} packages ===\n")
     semaphore = asyncio.Semaphore(concurrency)
     versions: Dict[str, Optional[str]] = {}
 
     async with httpx.AsyncClient(timeout=client_timeout) as client:
-        tasks = [
-            fetch_latest_version(
-                pkg, client, semaphore, request_timeout, cache_ttl
-            )
-            for pkg in package_names
-        ]
+        tasks = [fetch_latest_version(pkg, client, semaphore, request_timeout, cache_ttl, ignored_dependencies) for pkg in packages_to_fetch]
         for future in asyncio.as_completed(tasks):
             try:
                 pkg, version = await future
                 versions[pkg] = version
             except Exception as e:
-                logger.error(
-                    f"💥 Error processing result for {pkg}: {e}", exc_info=True
-                )
+                logger.error(f"💥 Error processing result for {pkg}: {e}", exc_info=True)
 
     logger.info(f"\n✅ Retrieved versions for {len(versions)} packages.\n")
     return versions
@@ -468,7 +457,7 @@ def parse_dependency(dep_str: str) -> DependencyInfo:
     dep_str = dep_str.strip()
 
     # Skip empty lines and comment-only lines
-    if not dep_str or dep_str.startswith('#'):
+    if not dep_str or dep_str.startswith("#"):
         return DependencyInfo("", "", "")
 
     match = DEP_PATTERN.match(dep_str)
@@ -487,7 +476,8 @@ def update_dependency_str(
     dep_str: str,
     latest_versions: VersionDict,
     version_spec: str,
-) -> Tuple[str, str]:
+    ignored_dependencies: Set[str],
+) -> Tuple[str, str, bool]:
     """
     Update a single dependency string with the latest version from PyPI.
 
@@ -495,18 +485,23 @@ def update_dependency_str(
         dep_str: Original dependency string.
         latest_versions: A dict from package -> latest version (or None).
         version_spec: One of "pinned" (==latest), "gte" (>=latest), or "lte" (<=latest).
+        ignored_dependencies: Set of package names to skip updating.
 
     Returns:
-        A tuple of (original_string, updated_string).
-        If the latest version is unavailable, the updated string == original.
+        A tuple of (original_string, updated_string, was_ignored).
+        If the latest version is unavailable or ignored, the updated string == original.
     """
     # Skip empty lines and comment-only lines
-    if not dep_str or dep_str.strip().startswith('#'):
-        return dep_str, dep_str
+    if not dep_str or dep_str.strip().startswith("#"):
+        return dep_str, dep_str, False
 
     dep_info = parse_dependency(dep_str)
     if not dep_info.name:  # Skip if no package name was found
-        return dep_str, dep_str
+        return dep_str, dep_str, False
+
+    # Check if this dependency should be ignored
+    if dep_info.name.lower() in ignored_dependencies:
+        return dep_str, dep_str, True
 
     latest = latest_versions.get(dep_info.name)
 
@@ -517,9 +512,9 @@ def update_dependency_str(
             new_dep = f"{dep_info.name}{dep_info.extras}<={latest}"
         else:  # default "gte"
             new_dep = f"{dep_info.name}{dep_info.extras}>={latest}"
-        return dep_str, new_dep
+        return dep_str, new_dep, False
 
-    return dep_str, dep_str
+    return dep_str, dep_str, False
 
 
 def extract_package_name(dep_str: str) -> str:
@@ -533,7 +528,7 @@ def extract_package_name(dep_str: str) -> str:
         Lowercase package name for consistent sorting.
     """
     # Skip comment-only lines
-    if not dep_str or dep_str.strip().startswith('#'):
+    if not dep_str or dep_str.strip().startswith("#"):
         return ""
 
     dep_info = parse_dependency(dep_str)
@@ -547,6 +542,7 @@ def update_dependency_array(
     sort_dependencies: bool,
     remove_comments: bool,
     version_spec: str,
+    ignored_dependencies: Set[str],
 ) -> Array:
     """
     Update a tomlkit Array of dependencies, optionally preserving comments.
@@ -560,6 +556,7 @@ def update_dependency_array(
         sort_dependencies: If True, sort dependencies alphabetically.
         remove_comments: If True, do not preserve comments from original entries.
         version_spec: The version update strategy ("pinned", "gte", or "lte").
+        ignored_dependencies: Set of package names to skip updating.
 
     Returns:
         A new tomlkit Array with updated (and possibly sorted) dependencies.
@@ -573,19 +570,14 @@ def update_dependency_array(
             continue
 
         dep_str = str(item)
-        original, new_dep = update_dependency_str(
-            dep_str, latest_versions, version_spec
-        )
+        original, new_dep, was_ignored = update_dependency_str(dep_str, latest_versions, version_spec, ignored_dependencies)
 
-        if original == new_dep:
-            print(
-                f"{COLOR_SUCCESS}Up-to-date: Before: {original} | After: {new_dep}"
-            )
+        if was_ignored:
+            print(f"{COLOR_SKIP}Ignored: {original} (in ignore list)")
+        elif original == new_dep:
+            print(f"{COLOR_SUCCESS}Up-to-date: Before: {original} | After: {new_dep}")
         else:
-            print(
-                f"{COLOR_WARNING}Updated: Before: {original} {Style.RESET_ALL}--> "
-                f"{COLOR_SUCCESS}{new_dep}"
-            )
+            print(f"{COLOR_WARNING}Updated: Before: {original} {Style.RESET_ALL}--> " f"{COLOR_SUCCESS}{new_dep}")
             if verbose:
                 logger.info(f"📝 Updated dependency: {original} -> {new_dep}")
 
@@ -605,14 +597,10 @@ def update_dependency_array(
 
                     # At DEBUG -> also show what comment we are preserving
                     if item.trivia.comment:
-                        logger.debug(
-                            f"Preserved comment text for {dep_str}: {item.trivia.comment}"
-                        )
+                        logger.debug(f"Preserved comment text for {dep_str}: {item.trivia.comment}")
 
                 except AttributeError:
-                    logger.warning(
-                        f"⚠️ Could not fully preserve trivia for {dep_str}"
-                    )
+                    logger.warning(f"⚠️ Could not fully preserve trivia for {dep_str}")
 
         updated_items.append((extract_package_name(new_dep), new_item))
 
@@ -696,6 +684,7 @@ def safe_get_dict_keys(container: Any) -> List[str]:
 # FILE PROCESSING
 # =====================================================================
 
+
 def is_requirements_txt(file_path: str) -> bool:
     """
     Determine if the file is a requirements.txt file based on extension.
@@ -706,7 +695,7 @@ def is_requirements_txt(file_path: str) -> bool:
     Returns:
         True if the file appears to be a requirements.txt file, False otherwise.
     """
-    return file_path.lower().endswith('.txt')
+    return file_path.lower().endswith(".txt")
 
 
 async def process_file(
@@ -720,6 +709,7 @@ async def process_file(
     remove_comments: bool,
     cache_ttl: float,
     version_spec: str,
+    ignored_dependencies: Set[str],
 ) -> bool:
     """
     Process and update dependencies in a dependency file.
@@ -737,6 +727,7 @@ async def process_file(
         remove_comments: If True, remove comments from updated dependencies.
         cache_ttl: Time (in seconds) to cache PyPI queries (0 disables).
         version_spec: Version update strategy ("pinned", "gte", or "lte").
+        ignored_dependencies: Set of package names to skip updating.
 
     Returns:
         True if processing succeeded, False otherwise.
@@ -753,6 +744,7 @@ async def process_file(
             remove_comments,
             cache_ttl,
             version_spec,
+            ignored_dependencies,
         )
     else:
         # Assume pyproject.toml for any other extension
@@ -767,6 +759,7 @@ async def process_file(
             remove_comments,
             cache_ttl,
             version_spec,
+            ignored_dependencies,
         )
 
 
@@ -781,6 +774,7 @@ async def process_requirements(
     remove_comments: bool,
     cache_ttl: float,
     version_spec: str,
+    ignored_dependencies: Set[str],
 ) -> bool:
     """
     Process and update dependencies in a requirements.txt file.
@@ -799,6 +793,7 @@ async def process_requirements(
         remove_comments: If True, remove comments from requirements.
         cache_ttl: Time (in seconds) to cache PyPI queries (0 disables).
         version_spec: Version update strategy ("pinned", "gte", or "lte").
+        ignored_dependencies: Set of package names to skip updating.
 
     Returns:
         True if processing succeeded, False otherwise.
@@ -807,14 +802,14 @@ async def process_requirements(
 
     try:
         # Read the requirements file
-        with open(requirements_path, 'r', encoding='utf-8') as f:
+        with open(requirements_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
 
         # Collect package names and handle comments
         package_set: Set[str] = set()
         for line in lines:
             line = line.strip()
-            if line and not line.startswith('#'):
+            if line and not line.startswith("#"):
                 dep_info = parse_dependency(line)
                 if dep_info.name:
                     package_set.add(dep_info.name)
@@ -832,6 +827,7 @@ async def process_requirements(
                 http_client_timeout,
                 http_timeout,
                 cache_ttl,
+                ignored_dependencies,
             )
         except Exception as e:
             logger.error(f"💥 Error fetching versions: {e}", exc_info=True)
@@ -852,21 +848,20 @@ async def process_requirements(
             original = line.strip()
 
             # Preserve empty lines and comments as is
-            if not original or original.startswith('#'):
-                if not remove_comments or not original.startswith('#'):
+            if not original or original.startswith("#"):
+                if not remove_comments or not original.startswith("#"):
                     updated_lines.append(original)
                 continue
 
             # Update dependency line
-            _, updated = update_dependency_str(original, latest_versions, version_spec)
+            _, updated, was_ignored = update_dependency_str(original, latest_versions, version_spec, ignored_dependencies)
 
-            if original == updated:
+            if was_ignored:
+                print(f"{COLOR_SKIP}Ignored: {original} (in ignore list)")
+            elif original == updated:
                 print(f"{COLOR_SUCCESS}Up-to-date: Before: {original} | After: {updated}")
             else:
-                print(
-                    f"{COLOR_WARNING}Updated: Before: {original} {Style.RESET_ALL}--> "
-                    f"{COLOR_SUCCESS}{updated}"
-                )
+                print(f"{COLOR_WARNING}Updated: Before: {original} {Style.RESET_ALL}--> " f"{COLOR_SUCCESS}{updated}")
                 if verbose:
                     logger.info(f"📝 Updated dependency: {original} -> {updated}")
 
@@ -877,8 +872,8 @@ async def process_requirements(
             logger.info("🔡 Sorting dependencies alphabetically.")
 
             # Split into comments/empty lines and package lines
-            comments = [line for line in updated_lines if not line or line.startswith('#')]
-            packages = [line for line in updated_lines if line and not line.startswith('#')]
+            comments = [line for line in updated_lines if not line or line.startswith("#")]
+            packages = [line for line in updated_lines if line and not line.startswith("#")]
 
             # Sort package lines by package name
             packages.sort(key=extract_package_name)
@@ -887,12 +882,10 @@ async def process_requirements(
             updated_lines = comments + packages
 
         # Format final content
-        new_content = '\n'.join(updated_lines)
+        new_content = "\n".join(updated_lines)
 
         if dry_run:
-            print(
-                f"\n🚀 {COLOR_HIGHLIGHT}Dry-run enabled. The following changes would be written to {requirements_path}:{Style.RESET_ALL}\n"
-            )
+            print(f"\n🚀 {COLOR_HIGHLIGHT}Dry-run enabled. The following changes would be written to {requirements_path}:{Style.RESET_ALL}\n")
             print(new_content)
             logger.info("🚀 Dry run completed; changes not saved.")
             return True
@@ -935,6 +928,7 @@ async def process_pyproject(
     remove_comments: bool,
     cache_ttl: float,
     version_spec: str,
+    ignored_dependencies: Set[str],
 ) -> bool:
     """
     Process and update dependencies in a pyproject.toml file.
@@ -954,6 +948,7 @@ async def process_pyproject(
         remove_comments: If True, remove comments from updated dependencies.
         cache_ttl: Time (in seconds) to cache PyPI queries (0 disables).
         version_spec: Version update strategy ("pinned", "gte", or "lte").
+        ignored_dependencies: Set of package names to skip updating.
 
     Returns:
         True if processing succeeded, False otherwise.
@@ -984,9 +979,7 @@ async def process_pyproject(
     # Check for [project]
     if "project" not in doc:
         logger.error(f"💥 No [project] section found in {pyproject_path}")
-        print(
-            f"{COLOR_ERROR}Error: No [project] section found in {pyproject_path}."
-        )
+        print(f"{COLOR_ERROR}Error: No [project] section found in {pyproject_path}.")
         return False
 
     project = doc["project"]
@@ -1002,6 +995,7 @@ async def process_pyproject(
         remove_comments,
         cache_ttl,
         version_spec,
+        ignored_dependencies,
     )
     if not result:
         return False
@@ -1021,9 +1015,7 @@ async def process_pyproject(
         test_doc = tomlkit.parse(new_content)
         if "project" not in test_doc:
             logger.error("💥 Post-update content lacks [project] section.")
-            print(
-                f"{COLOR_ERROR}Error: Updated file has no [project] section!"
-            )
+            print(f"{COLOR_ERROR}Error: Updated file has no [project] section!")
             return False
         logger.info("✅ Post-update TOML content validated successfully.")
     except tomlkit.exceptions.TOMLKitError as e:
@@ -1032,9 +1024,7 @@ async def process_pyproject(
         return False
 
     if dry_run:
-        print(
-            f"\n🚀 {COLOR_HIGHLIGHT}Dry-run enabled. The following changes would be written to {pyproject_path}:{Style.RESET_ALL}\n"
-        )
+        print(f"\n🚀 {COLOR_HIGHLIGHT}Dry-run enabled. The following changes would be written to {pyproject_path}:{Style.RESET_ALL}\n")
         print(new_content)
         logger.info("🚀 Dry run completed; changes not saved.")
         return True
@@ -1049,9 +1039,7 @@ async def process_pyproject(
         return True
     except PermissionError:
         logger.error(f"💥 Permission denied when writing to {pyproject_path}")
-        print(
-            f"{COLOR_ERROR}Permission denied when writing to {pyproject_path}"
-        )
+        print(f"{COLOR_ERROR}Permission denied when writing to {pyproject_path}")
         return False
     except Exception as e:
         logger.error(f"💥 Error writing updated file: {e}", exc_info=True)
@@ -1069,6 +1057,7 @@ async def _process_dependencies(
     remove_comments: bool,
     cache_ttl: float,
     version_spec: str,
+    ignored_dependencies: Set[str],
 ) -> bool:
     """
     Helper function to update [project].dependencies and [project].optional-dependencies.
@@ -1085,6 +1074,7 @@ async def _process_dependencies(
         remove_comments: If True, skip preserving comments.
         cache_ttl: Time in seconds to keep PyPI lookups cached. (0 disables.)
         version_spec: Version update strategy ("pinned", "gte", or "lte").
+        ignored_dependencies: Set of package names to skip updating.
 
     Returns:
         True if successful, False on errors.
@@ -1098,9 +1088,7 @@ async def _process_dependencies(
         try:
             package_set |= collect_unique_packages(deps_array)
         except Exception as e:
-            logger.error(
-                f"💥 Error processing dependencies: {e}", exc_info=True
-            )
+            logger.error(f"💥 Error processing dependencies: {e}", exc_info=True)
             print(f"{COLOR_ERROR}Error processing dependencies: {e}")
             return False
     else:
@@ -1108,16 +1096,10 @@ async def _process_dependencies(
 
     # Gather optional dependencies
     logger.info("\n--- [Optional Dependencies] Collecting packages ---\n")
-    opt_deps_container = (
-        project.get("optional-dependencies", None)
-        if hasattr(project, "get")
-        else None
-    )
+    opt_deps_container = project.get("optional-dependencies", None) if hasattr(project, "get") else None
     if opt_deps_container is not None:
         for group in safe_get_dict_keys(opt_deps_container):
-            logger.debug(
-                f"Collecting packages from optional group '{group}'..."
-            )
+            logger.debug(f"Collecting packages from optional group '{group}'...")
             group_array = safe_get_array(opt_deps_container, group)
             if group_array is not None:
                 try:
@@ -1127,9 +1109,7 @@ async def _process_dependencies(
                         f"💥 Error processing optional group '{group}': {e}",
                         exc_info=True,
                     )
-                    print(
-                        f"{COLOR_ERROR}Error processing optional group '{group}': {e}"
-                    )
+                    print(f"{COLOR_ERROR}Error processing optional group '{group}': {e}")
                     return False
     else:
         logger.info("ℹ️ No [project].optional-dependencies found; skipping.")
@@ -1137,9 +1117,7 @@ async def _process_dependencies(
     if verbose:
         sorted_pkgs = ", ".join(sorted(package_set))
         print(f"{COLOR_INFO}Found packages: {sorted_pkgs}")
-        logger.info(
-            f"🔎 Found {len(package_set)} unique packages to update: {sorted_pkgs}"
-        )
+        logger.info(f"🔎 Found {len(package_set)} unique packages to update: {sorted_pkgs}")
 
     if not package_set:
         logger.warning("⚠️ No packages found to update.")
@@ -1154,6 +1132,7 @@ async def _process_dependencies(
             http_client_timeout,
             http_timeout,
             cache_ttl,
+            ignored_dependencies,
         )
     except Exception as e:
         logger.error(f"💥 Error fetching versions: {e}", exc_info=True)
@@ -1161,9 +1140,7 @@ async def _process_dependencies(
         return False
 
     if verbose:
-        print(
-            f"\n{COLOR_INFO}Retrieved versions for {len(latest_versions)} packages\n"
-        )
+        print(f"\n{COLOR_INFO}Retrieved versions for {len(latest_versions)} packages\n")
         for pkg, ver in latest_versions.items():
             if ver:
                 print(f"{COLOR_INFO}{pkg} latest version: {ver}")
@@ -1178,6 +1155,7 @@ async def _process_dependencies(
         sort_dependencies,
         remove_comments,
         version_spec,
+        ignored_dependencies,
     ):
         return False
 
@@ -1189,6 +1167,7 @@ async def _process_dependencies(
         sort_dependencies,
         remove_comments,
         version_spec,
+        ignored_dependencies,
     ):
         return False
 
@@ -1202,6 +1181,7 @@ async def _update_main_dependencies(
     sort_dependencies: bool,
     remove_comments: bool,
     version_spec: str,
+    ignored_dependencies: Set[str],
 ) -> bool:
     """
     Update the [project].dependencies table in the TOML doc.
@@ -1213,6 +1193,7 @@ async def _update_main_dependencies(
         sort_dependencies: whether to sort dependencies.
         remove_comments: if True, do not preserve comments.
         version_spec: version update strategy ("pinned", "gte", or "lte").
+        ignored_dependencies: Set of package names to skip updating.
 
     Returns:
         True if successful, False otherwise.
@@ -1229,6 +1210,7 @@ async def _update_main_dependencies(
                     sort_dependencies=sort_dependencies,
                     remove_comments=remove_comments,
                     version_spec=version_spec,
+                    ignored_dependencies=ignored_dependencies,
                 )
         except Exception as e:
             logger.error(f"💥 Error updating dependencies: {e}", exc_info=True)
@@ -1248,6 +1230,7 @@ async def _update_optional_dependencies(
     sort_dependencies: bool,
     remove_comments: bool,
     version_spec: str,
+    ignored_dependencies: Set[str],
 ) -> bool:
     """
     Update the [project].optional-dependencies section in the TOML doc.
@@ -1259,15 +1242,12 @@ async def _update_optional_dependencies(
         sort_dependencies: whether to sort dependencies.
         remove_comments: if True, skip preserving comments.
         version_spec: version update strategy ("pinned", "gte", or "lte").
+        ignored_dependencies: Set of package names to skip updating.
 
     Returns:
         True if successful, False otherwise.
     """
-    opt_deps_container = (
-        project.get("optional-dependencies", None)
-        if hasattr(project, "get")
-        else None
-    )
+    opt_deps_container = project.get("optional-dependencies", None) if hasattr(project, "get") else None
     if opt_deps_container is not None:
         print(f"\n{COLOR_INFO}Updating [project].optional-dependencies ...\n")
         for group in safe_get_dict_keys(opt_deps_container):
@@ -1283,28 +1263,23 @@ async def _update_optional_dependencies(
                             sort_dependencies=sort_dependencies,
                             remove_comments=remove_comments,
                             version_spec=version_spec,
+                            ignored_dependencies=ignored_dependencies,
                         )
                 except Exception as e:
                     logger.error(
                         f"💥 Error updating optional group '{group}': {e}",
                         exc_info=True,
                     )
-                    print(
-                        f"{COLOR_ERROR}Error updating optional group '{group}': {e}"
-                    )
+                    print(f"{COLOR_ERROR}Error updating optional group '{group}': {e}")
                     return False
     else:
-        print(
-            f"{COLOR_WARNING}No [project].optional-dependencies found; skipping."
-        )
+        print(f"{COLOR_WARNING}No [project].optional-dependencies found; skipping.")
         logger.info("ℹ️ No [project].optional-dependencies found; skipping.")
 
     return True
 
 
-def create_backup(
-    source_path: str, backup_path: Optional[str] = None
-) -> Tuple[bool, Optional[str]]:
+def create_backup(source_path: str, backup_path: Optional[str] = None) -> Tuple[bool, Optional[str]]:
     """
     Create a backup copy of the source file. By default, uses a timestamped name
     like `.depupdate.<timestamp>` in the current directory.
@@ -1331,9 +1306,7 @@ def create_backup(
         logger.info(f"🗄  Backup created at: {backup_path}")
         return True, backup_path
     except PermissionError:
-        error_msg = (
-            f"💥 Permission denied when creating backup at {backup_path}"
-        )
+        error_msg = f"💥 Permission denied when creating backup at {backup_path}"
         logger.error(error_msg)
         return False, error_msg
     except FileNotFoundError:
@@ -1353,9 +1326,7 @@ def main() -> int:
     Returns:
         An integer representing the exit code.
     """
-    logger.info(
-        "\n🟢========== [DepUpdater] Starting Main Execution ==========\n"
-    )
+    logger.info("\n🟢========== [DepUpdater] Starting Main Execution ==========\n")
 
     # Read local YAML config first (if any), for override defaults:
     file_config = read_depsorter_config(".depsorter.yml")
@@ -1363,8 +1334,7 @@ def main() -> int:
     # CLI argument parser
     parser = argparse.ArgumentParser(
         description=(
-            "Update dependency version constraints in pyproject.toml to use pinned (==), >=, or <= "
-            "latest versions, preserving comments (unless removed) and optionally sorting dependencies."
+            "Update dependency version constraints in pyproject.toml to use pinned (==), >=, or <= " "latest versions, preserving comments (unless removed) and optionally sorting dependencies."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -1388,10 +1358,7 @@ def main() -> int:
     parser.add_argument(
         "--backup",
         default=file_config.get("backup", None),
-        help=(
-            "Backup file name. If not specified, a timestamped backup (e.g. .depupdate.1678891234)"
-            " will be created in the current directory."
-        ),
+        help=("Backup file name. If not specified, a timestamped backup (e.g. .depupdate.1678891234)" " will be created in the current directory."),
     )
     parser.add_argument(
         "--no-backup",
@@ -1414,9 +1381,7 @@ def main() -> int:
     parser.add_argument(
         "--http-client-timeout",
         type=float,
-        default=file_config.get(
-            "http_client_timeout", DEFAULT_HTTP_CLIENT_TIMEOUT
-        ),
+        default=file_config.get("http_client_timeout", DEFAULT_HTTP_CLIENT_TIMEOUT),
         help="Timeout for the overall HTTP client in seconds",
     )
     parser.add_argument(
@@ -1445,9 +1410,7 @@ def main() -> int:
         action="store_false",
         help="Disable alphabetical sorting of dependencies.",
     )
-    parser.set_defaults(
-        sort_dependencies=file_config.get("sort_dependencies", True)
-    )
+    parser.set_defaults(sort_dependencies=file_config.get("sort_dependencies", True))
 
     # Remove-comments flag
     parser.add_argument(
@@ -1477,13 +1440,21 @@ def main() -> int:
         "--version-spec",
         choices=["pinned", "gte", "lte"],
         default=file_config.get("version_spec", "gte"),
-        help=(
-            "How to update version constraints: 'pinned' uses '==latest', "
-            "'gte' uses '>=latest', 'lte' uses '<=latest'. Default is 'gte'."
-        ),
+        help=("How to update version constraints: 'pinned' uses '==latest', " "'gte' uses '>=latest', 'lte' uses '<=latest'. Default is 'gte'."),
+    )
+
+    # Ignore dependencies
+    parser.add_argument(
+        "--ignore-dependency",
+        action="append",
+        default=file_config.get("ignore_dependencies", []),
+        help="Dependency to ignore (can be specified multiple times)",
     )
 
     args = parser.parse_args()
+
+    # Convert ignored dependencies to lowercase set for case-insensitive comparison
+    ignored_dependencies = {dep.lower() for dep in args.ignore_dependency} if args.ignore_dependency else set()
 
     # Configure log level
     log_level = getattr(logging, args.log_level.upper(), logging.WARNING)
@@ -1510,6 +1481,7 @@ def main() -> int:
     logger.info(f"🔧 • cache_ttl             = {args.cache_ttl}")
     logger.info(f"🔧 • cache_file            = {args.cache_file}")
     logger.info(f"🔧 • version_spec          = {args.version_spec}")
+    logger.info(f"🔧 • ignore_dependencies   = {sorted(ignored_dependencies)}")
     logger.info("========================================\n")
 
     # ---------------------------------------------------------
@@ -1563,6 +1535,7 @@ def main() -> int:
                 remove_comments=args.remove_comments,
                 cache_ttl=args.cache_ttl,
                 version_spec=args.version_spec,
+                ignored_dependencies=ignored_dependencies,
             )
         )
     except KeyboardInterrupt:
@@ -1579,9 +1552,7 @@ def main() -> int:
     # ---------------------------------------------------------
     write_cache_to_file(args.cache_file)
 
-    logger.info(
-        "\n🔚========== [DepUpdater] Finished Main Execution ==========\n"
-    )
+    logger.info("\n🔚========== [DepUpdater] Finished Main Execution ==========\n")
     return EXIT_SUCCESS if success else EXIT_PROCESSING_ERROR
 
 
